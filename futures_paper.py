@@ -16,18 +16,13 @@ import websockets
 
 
 EXCHANGE_INFO_URL = "https://fapi.binance.com/fapi/v1/exchangeInfo"
-# Binance USD-M Futures combined market streams. Keep subscriptions split into
-# conservative chunks instead of opening one connection per symbol.
 WS_BASE = "wss://fstream.binance.com/market/stream?streams="
 STREAMS_PER_CONNECTION = 100
 
 
 def discover_usdt_perpetual_symbols() -> list[str]:
     """Fetch all currently trading USDT-quoted perpetual contracts from Binance."""
-    request = urllib.request.Request(
-        EXCHANGE_INFO_URL,
-        headers={"User-Agent": "paper-futures-scanner/1.0"},
-    )
+    request = urllib.request.Request(EXCHANGE_INFO_URL, headers={"User-Agent": "paper-futures-scanner/1.0"})
     try:
         with urllib.request.urlopen(request, timeout=20) as response:
             info = json.load(response)
@@ -35,8 +30,7 @@ def discover_usdt_perpetual_symbols() -> list[str]:
         raise RuntimeError(f"Could not retrieve Binance Futures contract list: {exc}") from exc
 
     symbols = [
-        item["symbol"]
-        for item in info.get("symbols", [])
+        item["symbol"] for item in info.get("symbols", [])
         if item.get("status") == "TRADING"
         and item.get("contractType") == "PERPETUAL"
         and item.get("quoteAsset") == "USDT"
@@ -80,14 +74,19 @@ class PaperAccount:
     def max_entry_usdt(self) -> float:
         return self.cash * self.max_position_fraction
 
-    def unrealized_pnl(self, marks: dict[str, float]) -> float:
+    def gross_unrealized_pnl(self, marks: dict[str, float]) -> float:
         return sum(
             pos.side * (marks.get(symbol, pos.entry_price) - pos.entry_price) * pos.quantity
             for symbol, pos in self.positions.items()
         )
 
+    def floating_pnl(self, marks: dict[str, float]) -> float:
+        # Includes entry fee already paid; excludes a hypothetical exit fee.
+        return self.gross_unrealized_pnl(marks) - sum(p.entry_fee for p in self.positions.values())
+
     def equity(self, marks: dict[str, float]) -> float:
-        return self.cash + sum(pos.margin for pos in self.positions.values()) + self.unrealized_pnl(marks)
+        reserved_margin = sum(pos.margin for pos in self.positions.values())
+        return self.cash + reserved_margin + self.gross_unrealized_pnl(marks)
 
     def close(self, symbol: str, price: float, timestamp: str, marks: dict[str, float]) -> None:
         position = self.positions.pop(symbol, None)
@@ -106,18 +105,16 @@ class PaperAccount:
             f"[{timestamp}] {symbol} {action} price={price:.8g} qty={position.quantity:.8g} "
             f"tradePnL=${net:+.4f} available=${self.cash:.2f} "
             f"equity=${self.equity(marks):.2f} realizedPnL=${self.realized_pnl:+.4f} "
-            f"unrealizedPnL=${self.unrealized_pnl(marks):+.4f} "
-            f"maxNextEntry=${self.max_entry_usdt():.2f}",
+            f"floatingPnL=${self.floating_pnl(marks):+.4f} maxNextEntry=${self.max_entry_usdt():.2f}",
             flush=True,
         )
 
     def open(self, symbol: str, side: int, price: float, timestamp: str, marks: dict[str, float]) -> None:
         if symbol in self.positions or self.cash <= 0 or price <= 0:
             return
-        margin = self.max_entry_usdt()
+        margin = min(self.max_entry_usdt(), self.cash / (1 + self.fee_rate))
         if margin <= 0:
             return
-        margin = min(margin, self.cash / (1 + self.fee_rate))
         quantity = margin / price  # 1x simulated notional; no leverage
         fee = margin * self.fee_rate
         self.cash -= margin + fee
@@ -128,7 +125,8 @@ class PaperAccount:
         print(
             f"[{timestamp}] {symbol} {action} price={price:.8g} qty={quantity:.8g} "
             f"entryNotional=${margin:.2f} fee=${fee:.4f} available=${self.cash:.2f} "
-            f"equity=${self.equity(marks):.2f} maxNextEntry=${self.max_entry_usdt():.2f}",
+            f"equity=${self.equity(marks):.2f} realizedPnL=${self.realized_pnl:+.4f} "
+            f"floatingPnL=${self.floating_pnl(marks):+.4f} maxNextEntry=${self.max_entry_usdt():.2f}",
             flush=True,
         )
 
@@ -145,6 +143,11 @@ class CrossoverScanner:
         self.closes: dict[str, deque[float]] = defaultdict(lambda: deque(maxlen=long_window + 1))
         self.marks: dict[str, float] = {}
         self.completed_candles = 0
+        self.last_dashboard = 0.0
+
+    def on_mark_price(self, symbol: str, price: float) -> None:
+        if price > 0:
+            self.marks[symbol] = price
 
     def on_candle(self, symbol: str, candle: dict[str, Any]) -> None:
         close = float(candle["c"])
@@ -174,54 +177,74 @@ class CrossoverScanner:
                 self.account.close(symbol, close, timestamp, self.marks)
             self.account.open(symbol, -1, close, timestamp, self.marks)
 
-    def report(self) -> None:
+    def print_dashboard(self) -> None:
+        now = time.time()
+        if now - self.last_dashboard < 5:
+            return
+        self.last_dashboard = now
         equity = self.account.equity(self.marks)
-        print("\nContinuous Binance USD-M Futures paper scanner stopped")
-        print(f"Symbols scanned:    {len(self.symbols)} USDT perpetual contracts")
-        print(f"Completed candles:  {self.completed_candles}")
-        print(f"Starting balance:   ${self.account.starting_cash:.2f} USDT")
-        print(f"Available balance:  ${self.account.cash:.2f} USDT")
-        print(f"Account equity:     ${equity:.2f} USDT")
-        print(f"Total PnL:          ${equity - self.account.starting_cash:+.4f} USDT")
-        print(f"Realized PnL:       ${self.account.realized_pnl:+.4f} USDT")
-        print(f"Unrealized PnL:     ${self.account.unrealized_pnl(self.marks):+.4f} USDT")
-        print(f"Entries / closed:   {self.account.entries} / {self.account.closed_trades}")
-        print(f"Fees paid:          ${self.account.fees_paid:.4f} USDT")
-        print(f"Max next entry:     ${self.account.max_entry_usdt():.2f} USDT (1x simulated)")
-        for symbol, position in self.account.positions.items():
-            side = "LONG" if position.side == 1 else "SHORT"
+        floating = self.account.floating_pnl(self.marks)
+        total_pnl = equity - self.account.starting_cash
+        timestamp = time.strftime("%H:%M:%S UTC", time.gmtime())
+        print(
+            f"\n[{timestamp}] LIVE PAPER ACCOUNT | scanned={len(self.symbols)} "
+            f"candles={self.completed_candles} positions={len(self.account.positions)}\n"
+            f"Balance available: ${self.account.cash:.4f} USDT | Equity: ${equity:.4f} USDT | "
+            f"Total PnL: ${total_pnl:+.4f} USDT\n"
+            f"Realized PnL: ${self.account.realized_pnl:+.4f} USDT | "
+            f"Floating PnL (entry fee included): ${floating:+.4f} USDT | "
+            f"Fees paid: ${self.account.fees_paid:.4f} | Max next entry: ${self.account.max_entry_usdt():.4f} USDT",
+            flush=True,
+        )
+        if not self.account.positions:
+            print("Open positions: none yet (waiting for crossover signals)", flush=True)
+            return
+        ranked = sorted(
+            self.account.positions.items(),
+            key=lambda item: abs(item[1].side * (self.marks.get(item[0], item[1].entry_price) - item[1].entry_price) * item[1].quantity),
+            reverse=True,
+        )
+        print("OPEN POSITIONS: SYMBOL | SIDE | ENTRY | LIVE MARK | FLOATING PNL", flush=True)
+        for symbol, position in ranked[:25]:
             mark = self.marks.get(symbol, position.entry_price)
-            pnl = position.side * (mark - position.entry_price) * position.quantity
-            print(f"Open: {symbol} {side}, entry={position.entry_price:.8g}, mark={mark:.8g}, unrealized=${pnl:+.4f}")
+            pnl = position.side * (mark - position.entry_price) * position.quantity - position.entry_fee
+            side = "LONG" if position.side == 1 else "SHORT"
+            print(f"  {symbol:16} {side:5} entry={position.entry_price:.8g} mark={mark:.8g} floating=${pnl:+.4f}", flush=True)
+        if len(ranked) > 25:
+            print(f"  ... and {len(ranked) - 25} more open positions", flush=True)
+
+    def report(self) -> None:
+        self.print_dashboard()
+        equity = self.account.equity(self.marks)
+        print("\nPaper scanner stopped")
+        print(f"Starting balance:  ${self.account.starting_cash:.2f} USDT")
+        print(f"Available balance: ${self.account.cash:.2f} USDT")
+        print(f"Account equity:    ${equity:.4f} USDT")
+        print(f"Total PnL:         ${equity - self.account.starting_cash:+.4f} USDT")
+        print(f"Realized PnL:      ${self.account.realized_pnl:+.4f} USDT")
+        print(f"Floating PnL:      ${self.account.floating_pnl(self.marks):+.4f} USDT")
+        print(f"Entries / closed:  {self.account.entries} / {self.account.closed_trades}")
+        print(f"Fees paid:         ${self.account.fees_paid:.4f} USDT")
 
 
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Continuous paper scanner for all trading Binance USDT perpetuals; no real orders.")
-    parser.add_argument("--symbols", default="ALL", help="ALL (default) or comma-separated Binance symbols")
-    parser.add_argument("--interval", default="1m", choices=["1m", "3m", "5m", "15m", "30m", "1h", "2h", "4h"], help="Kline interval")
-    parser.add_argument("--cash", type=float, default=10.0, help="Starting simulated USDT")
-    parser.add_argument("--short-window", type=int, default=5, help="Short SMA candles")
-    parser.add_argument("--long-window", type=int, default=20, help="Long SMA candles")
-    parser.add_argument("--max-position-fraction", type=float, default=0.25, help="Maximum entry as fraction of available balance")
-    parser.add_argument("--fee-rate", type=float, default=0.0004, help="Estimated fee per side; adjust to your fee assumptions")
-    return parser.parse_args()
-
-
-async def consume_chunk(scanner: CrossoverScanner, symbols: list[str]) -> None:
-    streams = "/".join(f"{symbol.lower()}@kline_{scanner.interval}" for symbol in symbols)
-    url = WS_BASE + quote(streams, safe="@/")
+async def consume_chunk(scanner: CrossoverScanner, streams: list[str]) -> None:
+    url = WS_BASE + quote("/".join(streams), safe="@/!")
     delay = 1
     while True:
         try:
             async with websockets.connect(url, ping_interval=20, ping_timeout=20, close_timeout=10) as socket:
-                print(f"Connected stream group ({len(symbols)} symbols)", flush=True)
+                print(f"Connected stream group ({len(streams)} streams)", flush=True)
                 delay = 1
                 async for raw in socket:
                     message = json.loads(raw)
                     payload = message.get("data", message)
-                    candle = payload.get("k")
-                    if candle and candle.get("x"):
-                        scanner.on_candle(payload.get("s", candle.get("s", "")), candle)
+                    event = payload.get("e")
+                    if event == "markPriceUpdate":
+                        scanner.on_mark_price(payload.get("s", ""), float(payload.get("p", 0)))
+                    else:
+                        candle = payload.get("k")
+                        if candle and candle.get("x"):
+                            scanner.on_candle(payload.get("s", candle.get("s", "")), candle)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -230,10 +253,35 @@ async def consume_chunk(scanner: CrossoverScanner, symbols: list[str]) -> None:
             delay = min(delay * 2, 60)
 
 
+async def dashboard_loop(scanner: CrossoverScanner) -> None:
+    while True:
+        scanner.print_dashboard()
+        await asyncio.sleep(1)
+
+
 async def scan_forever(scanner: CrossoverScanner) -> None:
-    chunks = [scanner.symbols[i:i + STREAMS_PER_CONNECTION] for i in range(0, len(scanner.symbols), STREAMS_PER_CONNECTION)]
-    print(f"Opening {len(chunks)} WebSocket connections for {len(scanner.symbols)} symbols (max {STREAMS_PER_CONNECTION} streams/connection).", flush=True)
-    await asyncio.gather(*(consume_chunk(scanner, chunk) for chunk in chunks))
+    stream_names = []
+    for symbol in scanner.symbols:
+        lower = symbol.lower()
+        stream_names.append(f"{lower}@kline_{scanner.interval}")
+        stream_names.append(f"{lower}@markPrice@1s")
+    chunks = [stream_names[i:i + STREAMS_PER_CONNECTION] for i in range(0, len(stream_names), STREAMS_PER_CONNECTION)]
+    print(f"Opening {len(chunks)} WebSocket connections for {len(scanner.symbols)} symbols / {len(stream_names)} streams.", flush=True)
+    jobs = [asyncio.create_task(consume_chunk(scanner, chunk)) for chunk in chunks]
+    jobs.append(asyncio.create_task(dashboard_loop(scanner)))
+    await asyncio.gather(*jobs)
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Continuous Binance USD-M Futures paper scanner; public data only, no real orders.")
+    parser.add_argument("--symbols", default="ALL", help="ALL or comma-separated Binance USDT perpetual symbols")
+    parser.add_argument("--interval", default="1m", choices=["1m", "3m", "5m", "15m", "30m", "1h", "2h", "4h"], help="Signal candle interval")
+    parser.add_argument("--cash", type=float, default=10.0, help="Starting simulated USDT")
+    parser.add_argument("--short-window", type=int, default=5, help="Short SMA candles")
+    parser.add_argument("--long-window", type=int, default=20, help="Long SMA candles")
+    parser.add_argument("--max-position-fraction", type=float, default=0.25, help="Max entry as fraction of available balance")
+    parser.add_argument("--fee-rate", type=float, default=0.0004, help="Estimated fee per side")
+    return parser.parse_args()
 
 
 def main() -> int:
@@ -251,12 +299,12 @@ def main() -> int:
         print(f"Error: {exc}", file=sys.stderr)
         return 2
 
-    print("CONTINUOUS BINANCE USD-M FUTURES PAPER SCANNER — ALL USDT PERPETUALS")
+    print("CONTINUOUS BINANCE USD-M FUTURES PAPER SCANNER — LIVE DASHBOARD")
     print("Public market data only. No API keys, no exchange orders, no leverage.")
     print(f"Discovered {len(symbols)} currently trading USDT perpetual contracts.")
     print(f"Interval: {args.interval} | SMA: {args.short_window}/{args.long_window}")
     print(f"Starting balance: ${args.cash:.2f} USDT | max entry now: ${account.max_entry_usdt():.2f} USDT")
-    print("Signals need a full warm-up after startup; press Ctrl+C to stop.", flush=True)
+    print("Dashboard refreshes every 5 seconds. Signals need warm-up; press Ctrl+C to stop.", flush=True)
     try:
         asyncio.run(scan_forever(scanner))
     except KeyboardInterrupt:
