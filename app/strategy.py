@@ -4,34 +4,28 @@ import pandas as pd
 
 
 class MovingAverageStrategy:
+    """Simple long-only SMA crossover strategy for demonstration/backtesting."""
+
     def __init__(self, short_window: int = 5, long_window: int = 10):
         if short_window <= 0 or long_window <= 0:
-            raise ValueError("Window sizes must be positive integers.")
+            raise ValueError("Window sizes must be positive integers")
         if short_window >= long_window:
-            raise ValueError("Short window must be smaller than the long window.")
-
+            raise ValueError("Short window must be smaller than long window")
         self.short_window = short_window
         self.long_window = long_window
 
     def generate_signals(self, data: pd.DataFrame) -> pd.DataFrame:
-        signals = data.copy()
-        signals["SMA_short"] = signals["Close"].rolling(window=self.short_window).mean()
-        signals["SMA_long"] = signals["Close"].rolling(window=self.long_window).mean()
-        signals["signal"] = 0
-
-        # Signal = 1 for bullish crossover, -1 for bearish crossover
-        for idx in range(1, len(signals)):
-            prev_short = signals.iloc[idx - 1]["SMA_short"]
-            prev_long = signals.iloc[idx - 1]["SMA_long"]
-            curr_short = signals.iloc[idx]["SMA_short"]
-            curr_long = signals.iloc[idx]["SMA_long"]
-
-            if pd.notna(prev_short) and pd.notna(prev_long) and pd.notna(curr_short) and pd.notna(curr_long):
-                if prev_short <= prev_long and curr_short > curr_long:
-                    signals.at[signals.index[idx], "signal"] = 1
-                elif prev_short >= prev_long and curr_short < curr_long:
-                    signals.at[signals.index[idx], "signal"] = -1
-
-        # Fill missing values with 0 for first rows
-        signals["signal"] = signals["signal"].fillna(0)
-        return signals
+        if "Close" not in data:
+            raise ValueError("Market data must contain a Close column")
+        result = data.copy()
+        close = pd.to_numeric(result["Close"], errors="coerce")
+        result["SMA_short"] = close.rolling(self.short_window, min_periods=self.short_window).mean()
+        result["SMA_long"] = close.rolling(self.long_window, min_periods=self.long_window).mean()
+        previous_short = result["SMA_short"].shift(1)
+        previous_long = result["SMA_long"].shift(1)
+        bullish = (previous_short <= previous_long) & (result["SMA_short"] > result["SMA_long"])
+        bearish = (previous_short >= previous_long) & (result["SMA_short"] < result["SMA_long"])
+        result["signal"] = 0
+        result.loc[bullish.fillna(False), "signal"] = 1
+        result.loc[bearish.fillna(False), "signal"] = -1
+        return result
