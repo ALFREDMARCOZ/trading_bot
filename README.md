@@ -5,9 +5,9 @@ This repository includes two separate paper-only tools:
 1. `main.py` — a one-shot historical stock backtest using Yahoo Finance.
 2. `futures_paper.py` — a continuous Binance USDⓈ-M Futures public-market-data scanner with simulated paper positions.
 
-## Continuous Binance Futures paper scanner (Windows CMD)
+## Scan every Binance USDT perpetual contract
 
-Use a clean Python environment in the extracted repo folder:
+In Windows CMD, from the extracted repository folder:
 
 ```cmd
 py -m venv .futures-venv
@@ -15,17 +15,17 @@ py -m venv .futures-venv
 py -m pip install -r requirements-futures.txt
 ```
 
-Run a continuous scan of the selected futures symbols:
+Run the scanner (the default `--symbols ALL` discovers all currently trading USDT-quoted perpetual contracts from Binance exchange information):
 
 ```cmd
-py futures_paper.py --symbols BTCUSDT,ETHUSDT,SOLUSDT --interval 1m --cash 10 --short-window 5 --long-window 20 --max-position-fraction 0.25
+py futures_paper.py --symbols ALL --interval 1m --cash 10 --short-window 5 --long-window 20 --max-position-fraction 0.25
 ```
 
-It connects to Binance USD-M Futures **public WebSocket market data**, processes completed candles, and stays running until you press `Ctrl+C`. It reconnects after a stream interruption. It prints paper entries/exits and, on shutdown, the available balance, account equity, realized/unrealized P&L, and open positions.
+The scanner divides symbols into WebSocket groups of at most 100 streams and scans completed candles continuously. It reconnects disconnected stream groups. The symbol list is discovered at startup; restart the program to pick up newly listed or delisted contracts. After startup, each symbol needs enough completed candles to warm up its moving averages before it can generate signals. Press `Ctrl+C` to stop and print the final simulated balance and P&L.
 
-With `$10` and `--max-position-fraction 0.25`, the maximum new entry is `$2.50` of available simulated balance, at 1x notional and without leverage. The cap recalculates from available balance before each entry. Fee is an estimate and configurable with `--fee-rate`; actual exchange fees differ.
+With `$10` and `--max-position-fraction 0.25`, the first maximum simulated entry is `$2.50` of available balance. Each symbol can have one simulated position, but all positions share the same simulated collateral, so the entry cap shrinks as collateral is allocated. Simulation is 1x notional with no leverage and approximate fees. It reads public market data only: no API keys, account access, or real order placement.
 
-The scanner only scans the symbols supplied with `--symbols`; it does not automatically subscribe to every futures contract. The SMA crossover is an example signal, not a recommendation. There is no API key, account access, or real order placement. Paper results are not predictions and cannot be relied on for urgent financial needs.
+This scanner currently supports active USDT-margined perpetual contracts; it does not include COIN-M futures. SMA crossovers are demonstration signals, not investment recommendations. Paper results are not predictions.
 
 ## Historical stock backtest
 
